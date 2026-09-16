@@ -1,11 +1,11 @@
-use crossbeam_utils::Backoff;
+use crossbeam_utils::{Backoff, CachePadded};
 use std::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     cmp::min,
     mem::MaybeUninit,
     ptr, slice,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
-    sync::{Mutex, PoisonError},
+    sync::{Mutex, OnceLock, PoisonError},
 };
 
 #[cfg(target_pointer_width = "16")]
@@ -14,6 +14,12 @@ const BLOCK_SIZE: usize = 16;
 const BLOCK_SIZE: usize = 32;
 #[cfg(target_pointer_width = "64")]
 const BLOCK_SIZE: usize = 64;
+
+/// Upper bound on the number of stripes in a bucket.
+///
+/// The actual number of stripes is derived from the available parallelism of the machine, rounded
+/// up to a power of two, so this only kicks in on very large machines.
+const MAX_STRIPES: usize = 256;
 
 /// Discrete chunk of values with atomic read/write access.
 struct Block<T> {
@@ -173,11 +179,14 @@ unsafe fn free_blocks<T>(mut block: *mut Block<T>) {
     }
 }
 
-/// A stripe of a bucket: a singly-linked list of blocks, plus tracking of in-flight operations.
+/// A single writer-affine stripe of a bucket.
 ///
-/// Tracking in-flight operations is what allows a stripe to be cleared while writers and readers
-/// are still using it: an operation "enters" the stripe before it touches the list, and "exits"
-/// once it is done.  A clearer detaches the list and then waits until every
+/// Each stripe is its own singly-linked list of blocks, and is only ever pushed to by the threads
+/// that map to it (usually a single thread), so pushes do not contend on shared cache lines.
+///
+/// Stripes also track in-flight operations, which is what allows a stripe to be cleared while
+/// writers and readers are still using it: an operation "enters" the stripe before it touches the
+/// list, and "exits" once it is done.  A clearer detaches the list and then waits until every
 /// operation that entered before the detach has exited, at which point the detached blocks can no
 /// longer be referenced by anyone and can be freed.
 ///
@@ -457,49 +466,148 @@ where
     }
 }
 
+/// Gets the number of stripes used by every bucket.
+///
+/// This is the available parallelism of the machine, rounded up to a power of two, so that the
+/// stripe index can be computed with a mask.
+fn stripe_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .next_power_of_two()
+            .clamp(1, MAX_STRIPES)
+    })
+}
+
+/// Gets the stripe index for the current thread, given the number of stripes in a bucket.
+///
+/// Every thread is assigned a unique, sequential ID the first time it pushes into any bucket, so
+/// the first N threads to push always land on distinct stripes of an N-stripe bucket.
+#[inline]
+fn current_stripe_index(count: usize) -> usize {
+    static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static THREAD_ID: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    let id = THREAD_ID.with(|cell| {
+        let mut id = cell.get();
+        if id == usize::MAX {
+            id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+            cell.set(id);
+        }
+        id
+    });
+
+    id & (count - 1)
+}
+
 /// A lock-free bucket with snapshot capabilities.
 ///
-/// This bucket is implemented as a singly-linked list of blocks, where each block is a small
-/// buffer that can hold a handful of elements.  There is no limit to how many elements can be in
-/// the bucket at a time.  Blocks are dynamically allocated as elements are pushed into the bucket.
+/// This bucket is implemented as a set of per-thread stripes, where each stripe is a singly-linked
+/// list of blocks, and each block is a small buffer that can hold a handful of elements.  There is
+/// no limit to how many elements can be in the bucket at a time.  Stripes and blocks are
+/// dynamically allocated as elements are pushed into the bucket.
+///
+/// Each writing thread is mapped to a stripe, and only ever pushes into that stripe.  There are as
+/// many stripes as the machine has available parallelism (rounded up to a power of two), so when
+/// there are at most that many writers, every writer has a stripe to itself and pushes never
+/// contend with each other.  Stripes and blocks are allocated the first time they're needed, so a
+/// bucket that's only written from a few threads only pays for a few stripes.
 ///
 /// Unlike a queue, buckets cannot be drained element by element: callers must iterate the whole
-/// structure.  Reading the bucket happens in a quasi-reverse fashion, to allow writers to make
-/// forward progress without affecting the iteration of the previously written values.
+/// structure.  Reading the bucket happens stripe by stripe, and within each stripe, in a
+/// quasi-reverse fashion, to allow writers to make forward progress without affecting the
+/// iteration of the previously written values.
 ///
-/// For example, in a scenario where an internal block can hold 4 elements, and the caller has
+/// For example, in a scenario where an internal block can hold 4 elements, and a single thread has
 /// written 10 elements to the bucket, you would expect to see the values in this order when iterating:
 ///
 /// ```text
 /// [6 7 8 9] [2 3 4 5] [0 1]
 /// ```
 ///
+/// When multiple threads have written to the bucket, the elements of each thread are grouped
+/// together in the same fashion, but the order in which the groups appear is arbitrary.
+///
 /// Block sizes are dependent on the target architecture, where each block can hold N items, and N
 /// is the number of bits in the target architecture's pointer width.
 pub struct AtomicBucket<T> {
-    stripe: Stripe<T>,
+    stripes: Box<[AtomicPtr<CachePadded<Stripe<T>>>]>,
 }
 
 // SAFETY: A bucket owns the values pushed into it, and hands out shared references to them from
 // any thread, so it's only `Sync` if the values are `Send + Sync`, and it's `Send` if the values
-// are `Send`.  The stripe and blocks themselves are safe to use from any thread.
+// are `Send`.  The stripes and blocks themselves are safe to use from any thread.
 unsafe impl<T: Send> Send for AtomicBucket<T> {}
 unsafe impl<T: Send + Sync> Sync for AtomicBucket<T> {}
 
 impl<T> AtomicBucket<T> {
     /// Creates a new, empty bucket.
     pub fn new() -> Self {
-        AtomicBucket { stripe: Stripe::new() }
+        let stripes =
+            (0..stripe_count()).map(|_| AtomicPtr::new(ptr::null_mut())).collect::<Vec<_>>();
+        AtomicBucket { stripes: stripes.into_boxed_slice() }
     }
 
     /// Checks whether or not this bucket is empty.
     pub fn is_empty(&self) -> bool {
-        self.stripe.is_empty()
+        self.stripes().all(Stripe::is_empty)
+    }
+
+    /// Gets the stripe for the current thread, allocating it if necessary.
+    #[inline]
+    fn current_stripe(&self) -> &Stripe<T> {
+        let index = current_stripe_index(self.stripes.len());
+
+        // SAFETY: The index is masked to the number of stripes, which is a power of two.
+        let slot = unsafe { self.stripes.get_unchecked(index) };
+
+        let mut stripe = slot.load(Ordering::Acquire);
+        if stripe.is_null() {
+            let new_stripe = Box::into_raw(Box::new(CachePadded::new(Stripe::new())));
+            match slot.compare_exchange(
+                ptr::null_mut(),
+                new_stripe,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // We won the race to install the stripe.
+                Ok(_) => stripe = new_stripe,
+                // Somebody else beat us, so just update our pointer.
+                Err(current) => {
+                    // SAFETY: We just allocated this stripe and nobody else has seen it.
+                    drop(unsafe { Box::from_raw(new_stripe) });
+                    stripe = current;
+                }
+            }
+        }
+
+        // SAFETY: Stripes are only ever freed when the bucket is dropped, and we hold a reference
+        // to the bucket.
+        unsafe { &*stripe }
+    }
+
+    /// Iterates over every stripe that has been allocated so far.
+    fn stripes(&self) -> impl Iterator<Item = &Stripe<T>> {
+        self.stripes.iter().filter_map(|slot| {
+            let stripe = slot.load(Ordering::Acquire);
+            if stripe.is_null() {
+                None
+            } else {
+                // SAFETY: Stripes are only ever freed when the bucket is dropped, and we hold a
+                // reference to the bucket.
+                Some(unsafe { &**stripe })
+            }
+        })
     }
 
     /// Pushes an element into the bucket.
     pub fn push(&self, value: T) {
-        self.stripe.push(value);
+        self.current_stripe().push(value);
     }
 
     /// Collects all of the elements written to the bucket.
@@ -508,8 +616,9 @@ impl<T> AtomicBucket<T> {
     /// elements within the bucket.  Consider [`data_with`](AtomicBucket::data_with) to incrementally iterate
     /// the internal blocks within the bucket.
     ///
-    /// Elements are in partial reverse order: blocks are iterated in reverse order, but the
-    /// elements within them will appear in their original order.
+    /// Elements are grouped by the thread that wrote them, in partial reverse order: blocks are
+    /// iterated in reverse order, but the elements within them will appear in their original
+    /// order.  The order of the groups is arbitrary.
     pub fn data(&self) -> Vec<T>
     where
         T: Clone,
@@ -521,8 +630,9 @@ impl<T> AtomicBucket<T> {
 
     /// Iterates all of the elements written to the bucket, invoking `f` for each block.
     ///
-    /// Elements are in partial reverse order: blocks are iterated in reverse order, but the
-    /// elements within them will appear in their original order.
+    /// Elements are grouped by the thread that wrote them, in partial reverse order: blocks are
+    /// iterated in reverse order, but the elements within them will appear in their original
+    /// order.  The order of the groups is arbitrary.
     ///
     /// # Note
     /// `f` must not call [`clear`](AtomicBucket::clear) or [`clear_with`](AtomicBucket::clear_with)
@@ -531,7 +641,9 @@ impl<T> AtomicBucket<T> {
     where
         F: FnMut(&[T]),
     {
-        self.stripe.data_with(&mut f);
+        for stripe in self.stripes() {
+            stripe.data_with(&mut f);
+        }
     }
 
     /// Clears the bucket.
@@ -554,8 +666,9 @@ impl<T> AtomicBucket<T> {
     /// vector, allowing the caller to read all of the old values while new values are being
     /// written, over and over again.
     ///
-    /// Elements are in partial reverse order: blocks are iterated in reverse order, but the
-    /// elements within them will appear in their original order.
+    /// Elements are grouped by the thread that wrote them, in partial reverse order: blocks are
+    /// iterated in reverse order, but the elements within them will appear in their original
+    /// order.  The order of the groups is arbitrary.
     ///
     /// # Note
     /// This method waits for reads and writes that are already in progress to complete, and does
@@ -566,7 +679,9 @@ impl<T> AtomicBucket<T> {
     where
         F: FnMut(&[T]),
     {
-        self.stripe.clear_with(&mut f);
+        for stripe in self.stripes() {
+            stripe.clear_with(&mut f);
+        }
     }
 }
 
@@ -579,16 +694,31 @@ impl<T> Default for AtomicBucket<T> {
 impl<T> Drop for AtomicBucket<T> {
     fn drop(&mut self) {
         // We have exclusive access to the bucket, so there can be no in-flight operations, and
-        // every block still attached to the bucket is exclusively ours to free.
-        //
-        // SAFETY: See above.
-        unsafe { free_blocks(*self.stripe.tail.get_mut()) }
+        // every stripe and block still attached to the bucket is exclusively ours to free.
+        for slot in self.stripes.iter_mut() {
+            let stripe = *slot.get_mut();
+            if stripe.is_null() {
+                continue;
+            }
+
+            // SAFETY: See above.
+            unsafe {
+                let stripe = Box::from_raw(stripe);
+                free_blocks(stripe.tail.load(Ordering::Acquire));
+                drop(stripe);
+            }
+        }
     }
 }
 
 impl<T> std::fmt::Debug for AtomicBucket<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AtomicBucket").field("type", &std::any::type_name::<T>()).finish()
+        let allocated = self.stripes().count();
+        f.debug_struct("AtomicBucket")
+            .field("type", &std::any::type_name::<T>())
+            .field("stripes", &self.stripes.len())
+            .field("allocated_stripes", &allocated)
+            .finish()
     }
 }
 
@@ -767,8 +897,8 @@ mod tests {
 
     #[test]
     fn test_bucket_many_writers_with_concurrent_clears() {
-        // Many writers, all pushing while a reader repeatedly clears the bucket: nothing may be
-        // lost or duplicated.
+        // More writers than there are stripes on any reasonable machine, all pushing while a
+        // reader repeatedly clears the bucket: nothing may be lost or duplicated.
         const WRITERS: usize = if cfg!(miri) { 8 } else { 300 };
         const PER_WRITER: usize = if cfg!(miri) { 200 } else { 20_000 };
         const CLEARS: usize = if cfg!(miri) { 20 } else { 200 };
@@ -948,7 +1078,7 @@ mod tests {
         let drops = AtomicUsize::new(0);
         let bucket = AtomicBucket::new();
 
-        // Push from several threads.
+        // Push from several threads so that several stripes are allocated.
         thread::scope(|s| {
             for _ in 0..4 {
                 s.spawn(|| {
