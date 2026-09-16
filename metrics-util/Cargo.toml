@@ -47,7 +47,6 @@ required-features = ["storage"]
 
 [dependencies]
 aho-corasick = { workspace = true, features = ["std"], optional = true }
-crossbeam-epoch = { workspace = true, features = ["alloc", "std"], optional = true }
 crossbeam-utils = { workspace = true, optional = true }
 hashbrown = { workspace = true, optional = true }
 indexmap = { workspace = true, optional = true }
@@ -88,4 +87,4 @@ layer-filter = ["aho-corasick"]
 layer-router = ["radix_trie"]
 recency = ["registry", "quanta"]
 registry = ["hashbrown", "storage"]
-storage = ["crossbeam-epoch", "crossbeam-utils", "rand", "rand_xoshiro", "sketches-ddsketch"]
+storage = ["crossbeam-utils", "rand", "rand_xoshiro", "sketches-ddsketch"]

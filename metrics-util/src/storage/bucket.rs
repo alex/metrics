@@ -1,11 +1,11 @@
-use crossbeam_epoch::{pin as epoch_pin, Atomic, Guard, Owned, Shared};
 use crossbeam_utils::Backoff;
 use std::{
     cell::UnsafeCell,
     cmp::min,
-    mem::{self, MaybeUninit},
-    slice,
-    sync::atomic::{AtomicUsize, Ordering},
+    mem::MaybeUninit,
+    ptr, slice,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::{Mutex, PoisonError},
 };
 
 #[cfg(target_pointer_width = "16")]
@@ -15,42 +15,31 @@ const BLOCK_SIZE: usize = 32;
 #[cfg(target_pointer_width = "64")]
 const BLOCK_SIZE: usize = 64;
 
-const DEFERRED_BLOCK_BATCH_SIZE: usize = 32;
-
 /// Discrete chunk of values with atomic read/write access.
 struct Block<T> {
     // Write index.
     write: AtomicUsize,
 
-    // Read bitmap.
+    // Per-slot "ready" flags.
     //
     // Internally, we track the write index which indicates what slot should be written by the next
     // writer.  This works fine as writers race via CAS to "acquire" a slot to write to.  The
     // trouble comes when attempting to read written values, as writers may still have writes
     // in-flight, thus leading to potential uninitialized reads, UB, and the world imploding.
     //
-    // We use a simple scheme where writers acknowledge their writes by setting a bit in `read`
-    // that corresponds to the index that they've written.  For example, a write at index 5 being
-    // complete can be verified by checking if `1 << 5` in `read` is set.  This allows writers to
-    // concurrently update `read` despite non-sequential indexes.
-    //
-    // Additionally, an optimization is then available where finding the longest sequential run of
-    // initialized slots can be trivially calculated by getting the number of trailing ones in
-    // `read`.  This allows reading the "length" of initialized values in constant time, without
-    // blocking.
-    //
-    // This optimization does mean, however, that the simplest implementation is limited to block
-    // sizes that match the number of bits available in the target platform pointer size.  A
-    // potential future optimization could use const generics to size an array of read bitmap
-    // atomics such that the total sum of the bits could be efficiently utilized, although this
-    // would involve more complex logic to read all of the atomics.
-    read: AtomicUsize,
+    // We use a simple scheme where writers acknowledge their writes by setting the flag that
+    // corresponds to the index that they've written, with a release store, so that publishing a
+    // value costs a plain store rather than a read-modify-write.  The number of initialized slots
+    // is then the length of the leading run of set flags, which readers compute by scanning the
+    // flags; that's a linear scan, but over a single cache line, and readers are rare compared to
+    // writers.
+    ready: [AtomicBool; BLOCK_SIZE],
 
     // The individual slots.
     slots: [MaybeUninit<UnsafeCell<T>>; BLOCK_SIZE],
 
     // The "next" block to iterate, aka the block that came before this one.
-    next: Atomic<Block<T>>,
+    next: AtomicPtr<Block<T>>,
 }
 
 impl<T> Block<T> {
@@ -59,26 +48,29 @@ impl<T> Block<T> {
         // SAFETY:
         // At a high level, all types inherent to  `Block<T>` can be safely zero initialized.
         //
-        // `write`/`read` are meant to start at zero (`AtomicUsize`)
+        // `write` is meant to start at zero (`AtomicUsize`)
+        // `ready` is meant to start all false (`AtomicBool`), which is zero
         // `slots` is an array of `MaybeUninit`, which is zero init safe
-        // `next` is meant to start as "null", where the pointer (`AtomicUsize`) is zero
+        // `next` is meant to start as "null", where the pointer (`AtomicPtr`) is zero
         unsafe { MaybeUninit::zeroed().assume_init() }
     }
 
     // Gets the length of the next block, if it exists.
-    pub(crate) fn next_len(&self, guard: &Guard) -> usize {
-        let tail = self.next.load(Ordering::Acquire, guard);
+    //
+    // SAFETY: The caller must ensure that the next block cannot be freed while this call is in
+    // progress, which is to say that the caller must have entered the owning stripe.
+    unsafe fn next_len(&self) -> usize {
+        let tail = self.next.load(Ordering::Acquire);
         if tail.is_null() {
             return 0;
         }
 
-        let tail_block = unsafe { tail.deref() };
-        tail_block.len()
+        (*tail).len()
     }
 
     /// Gets the current length of this block.
     pub fn len(&self) -> usize {
-        self.read.load(Ordering::Acquire).trailing_ones() as usize
+        self.ready.iter().take_while(|ready| ready.load(Ordering::Acquire)).count()
     }
 
     // Whether or not this block is currently quieseced i.e. no in-flight writes.
@@ -96,13 +88,15 @@ impl<T> Block<T> {
     /// Gets a slice of the data written to this block.
     pub fn data(&self) -> &[T] {
         // SAFETY:
-        // We can always get a pointer to the first slot, but the reference we give back will only
-        // be as long as the number of slots written, indicated by `len`.  The value of `len` is
-        // only updated once a slot has been fully written, guaranteeing the slot is initialized.
+        // We take a pointer to the whole slot array, so that the slice we hand back is derived from
+        // the array rather than from the first slot alone, but the slice will only be as long as
+        // the number of slots written, indicated by `len`.  The value of `len` is only updated
+        // once a slot has been fully written, guaranteeing that every slot in the slice is
+        // initialized, and slots are never written again once they've been initialized.
         let len = self.len();
         unsafe {
-            let head = self.slots.get_unchecked(0).as_ptr();
-            slice::from_raw_parts(head as *const T, len)
+            let head = self.slots.as_ptr() as *const T;
+            slice::from_raw_parts(head, len)
         }
     }
 
@@ -110,7 +104,7 @@ impl<T> Block<T> {
     pub fn push(&self, value: T) -> Result<(), T> {
         // Try to increment the index.  If we've reached the end of the block, let the bucket know
         // so it can attach another block.
-        let index = self.write.fetch_add(1, Ordering::AcqRel);
+        let index = self.write.fetch_add(1, Ordering::Relaxed);
         if index >= BLOCK_SIZE {
             return Err(value);
         }
@@ -125,8 +119,8 @@ impl<T> Block<T> {
             self.slots.get_unchecked(index).assume_init_ref().get().write(value);
         }
 
-        // Scoot our read index forward.
-        self.read.fetch_or(1 << index, Ordering::AcqRel);
+        // Publish the slot.
+        self.ready[index].store(true, Ordering::Release);
 
         Ok(())
     }
@@ -153,16 +147,313 @@ impl<T> Drop for Block<T> {
 
 impl<T> std::fmt::Debug for Block<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let guard = &epoch_pin();
-        let has_next = !self.next.load(Ordering::Acquire, guard).is_null();
+        let has_next = !self.next.load(Ordering::Acquire).is_null();
         f.debug_struct("Block")
             .field("type", &std::any::type_name::<T>())
             .field("block_size", &BLOCK_SIZE)
             .field("write", &self.write.load(Ordering::Acquire))
-            .field("read", &self.read.load(Ordering::Acquire))
             .field("len", &self.len())
             .field("has_next", &has_next)
             .finish()
+    }
+}
+
+/// Frees a singly-linked list of blocks, starting at `block`.
+///
+/// # Safety
+///
+/// The caller must have exclusive ownership of every block in the list: the list must have been
+/// detached from its stripe, and every operation that may have observed the blocks must have
+/// completed.
+unsafe fn free_blocks<T>(mut block: *mut Block<T>) {
+    while !block.is_null() {
+        let next = (*block).next.load(Ordering::Acquire);
+        drop(Box::from_raw(block));
+        block = next;
+    }
+}
+
+/// A stripe of a bucket: a singly-linked list of blocks, plus tracking of in-flight operations.
+///
+/// Tracking in-flight operations is what allows a stripe to be cleared while writers and readers
+/// are still using it: an operation "enters" the stripe before it touches the list, and "exits"
+/// once it is done.  A clearer detaches the list and then waits until every
+/// operation that entered before the detach has exited, at which point the detached blocks can no
+/// longer be referenced by anyone and can be freed.
+///
+/// In-flight operations are counted in one of two phases.  Operations enter in the current
+/// phase, and clearing flips the phase before waiting for the previous phase's count to drain,
+/// so that the wait cannot be starved by operations that keep entering: those all land in the new
+/// phase.  The phase and both counts live in a single atomic word, so that entering and flipping
+/// are ordered by that word's modification order: an operation either enters before the flip, in
+/// which case the clearer waits for it, or after it, in which case it observes the detached list
+/// as already gone.
+struct Stripe<T> {
+    // The most recently attached block.
+    tail: AtomicPtr<Block<T>>,
+
+    // The current phase and the in-flight count for each phase.  See `PHASE_BIT` and friends.
+    state: AtomicUsize,
+
+    // Serializes clearers, so that only one of them flips the phase at a time.
+    clearing: Mutex<()>,
+}
+
+// The top bit of `Stripe::state` is the current phase, and the remaining bits are split evenly
+// into the in-flight count for phase 0 (low bits) and phase 1 (high bits).
+const PHASE_BIT: usize = 1 << (usize::BITS - 1);
+const COUNT_BITS: u32 = (usize::BITS - 1) / 2;
+const COUNT_MASK: usize = (1 << COUNT_BITS) - 1;
+
+#[inline]
+fn phase_of(state: usize) -> usize {
+    (state & PHASE_BIT != 0) as usize
+}
+
+#[inline]
+fn count_unit(phase: usize) -> usize {
+    1 << (phase as u32 * COUNT_BITS)
+}
+
+#[inline]
+fn count_of(state: usize, phase: usize) -> usize {
+    (state >> (phase as u32 * COUNT_BITS)) & COUNT_MASK
+}
+
+impl<T> Stripe<T> {
+    fn new() -> Self {
+        Stripe {
+            tail: AtomicPtr::new(ptr::null_mut()),
+            state: AtomicUsize::new(0),
+            clearing: Mutex::new(()),
+        }
+    }
+
+    /// Marks an operation as having entered the stripe.
+    ///
+    /// Any block reachable from `tail` after this call cannot be freed until the returned guard
+    /// is dropped, which marks the operation as having exited.
+    fn enter(&self) -> InFlight<'_, T> {
+        // We have to increment the count of whatever the current phase is at the moment of the
+        // increment, but the phase can only be read together with the counts, so we guess it
+        // from a plain load, increment, and check the phase we actually observed.  If we guessed
+        // wrong, we undo the increment and try again; that's rare, as it takes a clear between
+        // the load and the increment.  Once we've incremented the count of the current phase: if
+        // we're ordered after a phase flip, then we acquire the clearer's detach of the list, and
+        // will observe the tail as null or newer; if we're ordered before it, then the clearer
+        // will see our entry in the previous phase and wait for us to exit.
+        loop {
+            let phase = phase_of(self.state.load(Ordering::Relaxed));
+            let previous = self.state.fetch_add(count_unit(phase), Ordering::Acquire);
+            if phase_of(previous) == phase {
+                return InFlight { stripe: self, phase };
+            }
+
+            self.state.fetch_sub(count_unit(phase), Ordering::Release);
+        }
+    }
+
+    /// Marks an operation that entered in the given phase as having exited the stripe.
+    fn exit(&self, phase: usize) {
+        // Release, so that a clearer that observes our exit also observes everything we did to
+        // the blocks before it.
+        self.state.fetch_sub(count_unit(phase), Ordering::Release);
+    }
+
+    /// Detaches the current list of blocks from the stripe, returning the first block.
+    ///
+    /// Once this method returns, no other operation can reach the detached blocks, so they may be
+    /// freed by the caller after they've been processed.
+    ///
+    /// The caller must hold the `clearing` lock.
+    fn detach(&self) -> *mut Block<T> {
+        let detached = self.tail.swap(ptr::null_mut(), Ordering::AcqRel);
+        if detached.is_null() {
+            return detached;
+        }
+
+        // Flip the phase, and then wait for every operation that entered in the previous phase
+        // to exit.  Any operation that could have observed the detached blocks must have entered
+        // in the previous phase, and every operation that enters from here on lands in the new
+        // phase, so the previous phase's count can only go down.
+        let previous = phase_of(self.state.fetch_xor(PHASE_BIT, Ordering::AcqRel));
+        let backoff = Backoff::new();
+        while count_of(self.state.load(Ordering::Acquire), previous) != 0 {
+            backoff.snooze();
+        }
+
+        detached
+    }
+
+    /// Pushes a value into this stripe.
+    fn push(&self, value: T) {
+        let _in_flight = self.enter();
+
+        let mut original = value;
+        loop {
+            // Load the tail block, or install a new one.
+            let mut tail = self.tail.load(Ordering::Acquire);
+            if tail.is_null() {
+                // No blocks at all yet.  We need to create one.
+                let new_block = Box::into_raw(Box::new(Block::new()));
+                match self.tail.compare_exchange(
+                    ptr::null_mut(),
+                    new_block,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    // We won the race to install the new block.
+                    Ok(_) => tail = new_block,
+                    // Somebody else beat us, so just update our pointer.
+                    Err(current) => {
+                        // SAFETY: We just allocated this block and nobody else has seen it.
+                        drop(unsafe { Box::from_raw(new_block) });
+                        tail = current;
+                    }
+                }
+            }
+
+            // SAFETY: We've entered the stripe, so the tail block cannot be freed until we exit.
+            let tail_block = unsafe { &*tail };
+
+            // We have a block now, so we need to try writing to it.
+            match tail_block.push(original) {
+                // If the push was OK, then the block wasn't full.  It might _now_ be full, but we'll
+                // let future callers deal with installing a new block if necessary.
+                Ok(()) => break,
+                // The block was full, so we've been given the value back and we need to install a new block.
+                Err(value) => {
+                    let new_block = Box::into_raw(Box::new(Block::new()));
+
+                    // SAFETY: Nobody else can see the new block until we install it below.
+                    unsafe { (*new_block).next.store(tail, Ordering::Release) };
+
+                    match self.tail.compare_exchange(
+                        tail,
+                        new_block,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        // We managed to install the block, so now push into it.
+                        Ok(_) => {
+                            // SAFETY: We've entered the stripe, so the block cannot be freed.
+                            let new_tail = unsafe { &*new_block };
+                            match new_tail.push(value) {
+                                // We wrote the value successfully, so we're good here!
+                                Ok(()) => break,
+                                // The block was full, so just loop and start over.
+                                Err(value) => original = value,
+                            }
+                        }
+                        // Somebody else installed a block (or the stripe was cleared) before us,
+                        // so let's just start over.
+                        Err(_) => {
+                            // SAFETY: We just allocated this block and nobody else has seen it.
+                            drop(unsafe { Box::from_raw(new_block) });
+                            original = value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether or not this stripe has any values in it.
+    fn is_empty(&self) -> bool {
+        let _in_flight = self.enter();
+
+        let tail = self.tail.load(Ordering::Acquire);
+        if tail.is_null() {
+            return true;
+        }
+
+        // We have to check the next block of our tail in case the current tail is simply a
+        // fresh block that has not been written to yet.
+        //
+        // SAFETY: We've entered the stripe, so no block reachable from the tail can be freed.
+        unsafe {
+            let tail_block = &*tail;
+            tail_block.len() == 0 && tail_block.next_len() == 0
+        }
+    }
+
+    /// Iterates all of the values in this stripe, invoking `f` for each block.
+    fn data_with<F>(&self, f: &mut F)
+    where
+        F: FnMut(&[T]),
+    {
+        let _in_flight = self.enter();
+
+        // SAFETY: We've entered the stripe, so no block reachable from the tail can be freed, and
+        // the guard exits the stripe even if `f` unwinds.
+        unsafe { visit_blocks(self.tail.load(Ordering::Acquire), f) };
+    }
+
+    /// Clears this stripe, invoking `f` for each block before it's freed.
+    fn clear_with<F>(&self, f: &mut F)
+    where
+        F: FnMut(&[T]),
+    {
+        let _guard = self.clearing.lock().unwrap_or_else(PoisonError::into_inner);
+
+        // SAFETY: We've detached the blocks and waited for every operation that could have
+        // observed them to exit, so we now exclusively own them, and they're freed when
+        // `detached` is dropped, even if `f` unwinds.
+        let detached = Detached(self.detach());
+        unsafe { visit_blocks(detached.0, f) };
+    }
+}
+
+/// An in-flight operation on a stripe, which exits the stripe when dropped.
+struct InFlight<'a, T> {
+    stripe: &'a Stripe<T>,
+    phase: usize,
+}
+
+impl<T> Drop for InFlight<'_, T> {
+    fn drop(&mut self) {
+        self.stripe.exit(self.phase);
+    }
+}
+
+/// A list of blocks that has been detached from its stripe, and is freed when dropped.
+struct Detached<T>(*mut Block<T>);
+
+impl<T> Drop for Detached<T> {
+    fn drop(&mut self) {
+        // SAFETY: A detached list is exclusively owned by whoever detached it.
+        unsafe { free_blocks(self.0) }
+    }
+}
+
+/// Visits every block in the list starting at `block`, invoking `f` with each block's data.
+///
+/// # Safety
+///
+/// The caller must ensure that no block in the list can be freed for the duration of the call.
+unsafe fn visit_blocks<T, F>(mut block: *mut Block<T>, f: &mut F)
+where
+    F: FnMut(&[T]),
+{
+    let backoff = Backoff::new();
+
+    // While we have a valid block -- either `tail` or the next block as we keep reading -- we
+    // load the data from each block and process it by calling `f`.
+    while !block.is_null() {
+        let block_ref = &*block;
+
+        // We wait for the block to be quiesced to ensure we get any in-flight writes, and
+        // snoozing specifically yields the reading thread to ensure things are given a
+        // chance to complete.
+        while !block_ref.is_quiesced() {
+            backoff.snooze();
+        }
+
+        // Read the data out of the block.
+        f(block_ref.data());
+
+        // Load the next block.
+        block = block_ref.next.load(Ordering::Acquire);
     }
 }
 
@@ -185,92 +476,30 @@ impl<T> std::fmt::Debug for Block<T> {
 ///
 /// Block sizes are dependent on the target architecture, where each block can hold N items, and N
 /// is the number of bits in the target architecture's pointer width.
-#[derive(Debug)]
 pub struct AtomicBucket<T> {
-    tail: Atomic<Block<T>>,
+    stripe: Stripe<T>,
 }
+
+// SAFETY: A bucket owns the values pushed into it, and hands out shared references to them from
+// any thread, so it's only `Sync` if the values are `Send + Sync`, and it's `Send` if the values
+// are `Send`.  The stripe and blocks themselves are safe to use from any thread.
+unsafe impl<T: Send> Send for AtomicBucket<T> {}
+unsafe impl<T: Send + Sync> Sync for AtomicBucket<T> {}
 
 impl<T> AtomicBucket<T> {
     /// Creates a new, empty bucket.
     pub fn new() -> Self {
-        AtomicBucket { tail: Atomic::null() }
+        AtomicBucket { stripe: Stripe::new() }
     }
 
     /// Checks whether or not this bucket is empty.
     pub fn is_empty(&self) -> bool {
-        let guard = &epoch_pin();
-        let tail = self.tail.load(Ordering::Acquire, guard);
-        if tail.is_null() {
-            return true;
-        }
-
-        // We have to check the next block of our tail in case the current tail is simply a fresh
-        // block that has not been written to yet.
-        let tail_block = unsafe { tail.deref() };
-        tail_block.len() == 0 && tail_block.next_len(guard) == 0
+        self.stripe.is_empty()
     }
 
     /// Pushes an element into the bucket.
     pub fn push(&self, value: T) {
-        let mut original = value;
-        let guard = &epoch_pin();
-        loop {
-            // Load the tail block, or install a new one.
-            let mut tail = self.tail.load(Ordering::Acquire, guard);
-            if tail.is_null() {
-                // No blocks at all yet.  We need to create one.
-                match self.tail.compare_exchange(
-                    Shared::null(),
-                    Owned::new(Block::new()),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    guard,
-                ) {
-                    // We won the race to install the new block.
-                    Ok(ptr) => tail = ptr,
-                    // Somebody else beat us, so just update our pointer.
-                    Err(e) => tail = e.current,
-                }
-            }
-
-            // We have a block now, so we need to try writing to it.
-            let tail_block = unsafe { tail.deref() };
-            match tail_block.push(original) {
-                // If the push was OK, then the block wasn't full.  It might _now_ be full, but we'll
-                // let future callers deal with installing a new block if necessary.
-                Ok(_) => return,
-                // The block was full, so we've been given the value back and we need to install a new block.
-                Err(value) => {
-                    match self.tail.compare_exchange(
-                        tail,
-                        Owned::new(Block::new()),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        guard,
-                    ) {
-                        // We managed to install the block, so we need to link this new block to
-                        // the nextious block.
-                        Ok(ptr) => {
-                            let new_tail = unsafe { ptr.deref() };
-                            new_tail.next.store(tail, Ordering::Release);
-
-                            // Now push into our new block.
-                            match new_tail.push(value) {
-                                // We wrote the value successfully, so we're good here!
-                                Ok(_) => return,
-                                // The block was full, so just loop and start over.
-                                Err(value) => {
-                                    original = value;
-                                    continue;
-                                }
-                            }
-                        }
-                        // Somebody else installed the block before us, so let's just start over.
-                        Err(_) => original = value,
-                    }
-                }
-            }
-        }
+        self.stripe.push(value);
     }
 
     /// Collects all of the elements written to the bucket.
@@ -294,50 +523,27 @@ impl<T> AtomicBucket<T> {
     ///
     /// Elements are in partial reverse order: blocks are iterated in reverse order, but the
     /// elements within them will appear in their original order.
+    ///
+    /// # Note
+    /// `f` must not call [`clear`](AtomicBucket::clear) or [`clear_with`](AtomicBucket::clear_with)
+    /// on this bucket, as clearing waits for in-progress reads to complete.
     pub fn data_with<F>(&self, mut f: F)
     where
         F: FnMut(&[T]),
     {
-        let guard = &epoch_pin();
-        let backoff = Backoff::new();
-
-        // While we have a valid block -- either `tail` or the next block as we keep reading -- we
-        // load the data from each block and process it by calling `f`.
-        let mut block_ptr = self.tail.load(Ordering::Acquire, guard);
-        while !block_ptr.is_null() {
-            let block = unsafe { block_ptr.deref() };
-
-            // We wait for the block to be quiesced to ensure we get any in-flight writes, and
-            // snoozing specifically yields the reading thread to ensure things are given a
-            // chance to complete.
-            while !block.is_quiesced() {
-                backoff.snooze();
-            }
-
-            // Read the data out of the block.
-            let data = block.data();
-            f(data);
-
-            // Load the next block.
-            block_ptr = block.next.load(Ordering::Acquire, guard);
-        }
+        self.stripe.data_with(&mut f);
     }
 
     /// Clears the bucket.
     ///
-    /// Deallocation of the internal blocks happens only when all readers have finished, and so
-    /// will not necessarily occur during or immediately preceding this method.
-    ///
     /// # Note
-    /// This method will not affect reads that are already in progress.
+    /// This method waits for reads and writes that are already in progress to complete, and does
+    /// not affect any values that are written after it has begun.
     pub fn clear(&self) {
         self.clear_with(|_: &[T]| {})
     }
 
     /// Clears the bucket, invoking `f` for every block that will be cleared.
-    ///
-    /// Deallocation of the internal blocks happens only when all readers have finished, and so
-    /// will not necessarily occur during or immediately preceding this method.
     ///
     /// This method is useful for accumulating values and then observing them, in a way that allows
     /// the caller to avoid visiting the same values again the next time.
@@ -348,93 +554,50 @@ impl<T> AtomicBucket<T> {
     /// vector, allowing the caller to read all of the old values while new values are being
     /// written, over and over again.
     ///
+    /// Elements are in partial reverse order: blocks are iterated in reverse order, but the
+    /// elements within them will appear in their original order.
+    ///
     /// # Note
-    /// This method will not affect reads that are already in progress.
+    /// This method waits for reads and writes that are already in progress to complete, and does
+    /// not affect any values that are written after it has begun.  The internal blocks are freed
+    /// as soon as `f` has been called for them.  Concurrent calls to this method are serialized,
+    /// and `f` must not call [`clear`](AtomicBucket::clear) or `clear_with` on this bucket.
     pub fn clear_with<F>(&self, mut f: F)
     where
         F: FnMut(&[T]),
     {
-        // We simply swap the tail pointer which effectively clears the bucket.  Callers might
-        // still be in process of writing to the tail node, or reading the data, but new callers
-        // will see it as empty until another write proceeds.
-        let guard = &epoch_pin();
-        let mut block_ptr = self.tail.load(Ordering::Acquire, guard);
-        if !block_ptr.is_null()
-            && self
-                .tail
-                .compare_exchange(
-                    block_ptr,
-                    Shared::null(),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                    guard,
-                )
-                .is_ok()
-        {
-            let backoff = Backoff::new();
-            let mut freeable_blocks = Vec::new();
-
-            // While we have a valid block -- either `tail` or the next block as we keep reading -- we
-            // load the data from each block and process it by calling `f`.
-            while !block_ptr.is_null() {
-                let block = unsafe { block_ptr.deref() };
-
-                // We wait for the block to be quiesced to ensure we get any in-flight writes, and
-                // snoozing specifically yields the reading thread to ensure things are given a
-                // chance to complete.
-                while !block.is_quiesced() {
-                    backoff.snooze();
-                }
-
-                // Read the data out of the block.
-                let data = block.data();
-                f(data);
-
-                // Load the next block and take the shared reference to the current.
-                let old_block_ptr =
-                    mem::replace(&mut block_ptr, block.next.load(Ordering::Acquire, guard));
-
-                freeable_blocks.push(old_block_ptr);
-                if freeable_blocks.len() >= DEFERRED_BLOCK_BATCH_SIZE {
-                    let blocks = mem::take(&mut freeable_blocks);
-                    unsafe {
-                        guard.defer_unchecked(move || {
-                            for block in blocks {
-                                drop(block.into_owned());
-                            }
-                        });
-                    }
-                }
-            }
-
-            // Free any remaining old blocks.
-            if !freeable_blocks.is_empty() {
-                unsafe {
-                    guard.defer_unchecked(move || {
-                        for block in freeable_blocks {
-                            drop(block.into_owned());
-                        }
-                    });
-                }
-            }
-
-            // This asks the global collector to attempt to drive execution of deferred operations a
-            // little sooner than it may have done so otherwise.
-            guard.flush();
-        }
+        self.stripe.clear_with(&mut f);
     }
 }
 
 impl<T> Default for AtomicBucket<T> {
     fn default() -> Self {
-        Self { tail: Atomic::null() }
+        Self::new()
+    }
+}
+
+impl<T> Drop for AtomicBucket<T> {
+    fn drop(&mut self) {
+        // We have exclusive access to the bucket, so there can be no in-flight operations, and
+        // every block still attached to the bucket is exclusively ours to free.
+        //
+        // SAFETY: See above.
+        unsafe { free_blocks(*self.stripe.tail.get_mut()) }
+    }
+}
+
+impl<T> std::fmt::Debug for AtomicBucket<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicBucket").field("type", &std::any::type_name::<T>()).finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AtomicBucket, Block, BLOCK_SIZE};
-    use crossbeam_utils::thread::scope;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+    use std::thread;
 
     #[test]
     fn test_create_new_block() {
@@ -497,38 +660,19 @@ mod tests {
         let data = block.data();
         assert_eq!(data.len(), 0);
 
-        let res = scope(|s| {
-            let t1 = s.spawn(|_| {
-                let mut i = 0;
+        let total = thread::scope(|s| {
+            let writer = || {
                 let mut total = 0;
-                while i < BLOCK_SIZE as u64 / 2 {
+                for i in 0..BLOCK_SIZE as u64 / 2 {
                     assert!(block.push(i).is_ok());
-
                     total += i;
-                    i += 1;
                 }
                 total
-            });
-
-            let t2 = s.spawn(|_| {
-                let mut i = 0;
-                let mut total = 0;
-                while i < BLOCK_SIZE as u64 / 2 {
-                    assert!(block.push(i).is_ok());
-
-                    total += i;
-                    i += 1;
-                }
-                total
-            });
-
-            let t1_total = t1.join().unwrap();
-            let t2_total = t2.join().unwrap();
-
-            t1_total + t2_total
+            };
+            let t1 = s.spawn(writer);
+            let t2 = s.spawn(writer);
+            t1.join().unwrap() + t2.join().unwrap()
         });
-
-        let total = res.unwrap();
 
         let data = block.data();
         assert_eq!(data.len(), BLOCK_SIZE);
@@ -575,50 +719,147 @@ mod tests {
     }
 
     #[test]
+    fn test_bucket_single_thread_order() {
+        // Blocks are visited newest first, and values within a block are in insertion order.
+        let bucket = AtomicBucket::new();
+        let target = BLOCK_SIZE * 2 + BLOCK_SIZE / 2;
+        for i in 0..target {
+            bucket.push(i);
+        }
+
+        let mut expected = Vec::new();
+        expected.extend(BLOCK_SIZE * 2..target);
+        expected.extend(BLOCK_SIZE..BLOCK_SIZE * 2);
+        expected.extend(0..BLOCK_SIZE);
+        assert_eq!(bucket.data(), expected);
+    }
+
+    #[test]
     fn test_bucket_write_then_read_mt() {
+        const PER_WRITER: u64 =
+            (if cfg!(miri) { BLOCK_SIZE * 10 } else { BLOCK_SIZE * 100_000 }) as u64;
+
         let bucket = AtomicBucket::new();
 
         let snapshot = bucket.data();
         assert_eq!(snapshot.len(), 0);
 
-        let res = scope(|s| {
-            let t1 = s.spawn(|_| {
-                let mut i = 0;
+        let total = thread::scope(|s| {
+            let writer = || {
                 let mut total = 0;
-                while i < BLOCK_SIZE as u64 * 100_000 {
+                for i in 0..PER_WRITER {
                     bucket.push(i);
-
                     total += i;
-                    i += 1;
                 }
                 total
-            });
-
-            let t2 = s.spawn(|_| {
-                let mut i = 0;
-                let mut total = 0;
-                while i < BLOCK_SIZE as u64 * 100_000 {
-                    bucket.push(i);
-
-                    total += i;
-                    i += 1;
-                }
-                total
-            });
-
-            let t1_total = t1.join().unwrap();
-            let t2_total = t2.join().unwrap();
-
-            t1_total + t2_total
+            };
+            let t1 = s.spawn(writer);
+            let t2 = s.spawn(writer);
+            t1.join().unwrap() + t2.join().unwrap()
         });
 
-        let total = res.unwrap();
-
         let snapshot = bucket.data();
-        assert_eq!(snapshot.len(), BLOCK_SIZE * 200_000);
+        assert_eq!(snapshot.len(), 2 * PER_WRITER as usize);
 
         let sum = snapshot.iter().sum::<u64>();
         assert_eq!(sum, total);
+    }
+
+    #[test]
+    fn test_bucket_many_writers_with_concurrent_clears() {
+        // Many writers, all pushing while a reader repeatedly clears the bucket: nothing may be
+        // lost or duplicated.
+        const WRITERS: usize = if cfg!(miri) { 8 } else { 300 };
+        const PER_WRITER: usize = if cfg!(miri) { 200 } else { 20_000 };
+        const CLEARS: usize = if cfg!(miri) { 20 } else { 200 };
+
+        let bucket = AtomicBucket::new();
+        let barrier = Barrier::new(WRITERS + 1);
+        let mut seen_total = 0;
+        let mut seen_count = 0;
+
+        let expected_total = thread::scope(|s| {
+            let writers = (0..WRITERS)
+                .map(|w| {
+                    let (bucket, barrier) = (&bucket, &barrier);
+                    s.spawn(move || {
+                        barrier.wait();
+                        let mut total = 0;
+                        for i in 0..PER_WRITER {
+                            let value = w * PER_WRITER + i;
+                            bucket.push(value);
+                            total += value;
+                        }
+                        total
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            barrier.wait();
+            for _ in 0..CLEARS {
+                bucket.clear_with(|xs| {
+                    seen_total += xs.iter().sum::<usize>();
+                    seen_count += xs.len();
+                });
+                thread::yield_now();
+            }
+
+            writers.into_iter().map(|w| w.join().unwrap()).sum::<usize>()
+        });
+
+        // Pick up whatever was written after the last clear.
+        bucket.clear_with(|xs| {
+            seen_total += xs.iter().sum::<usize>();
+            seen_count += xs.len();
+        });
+
+        assert_eq!(seen_count, WRITERS * PER_WRITER);
+        assert_eq!(seen_total, expected_total);
+        assert!(bucket.is_empty());
+    }
+
+    #[test]
+    fn test_bucket_concurrent_readers_and_clears() {
+        // Non-clearing readers must never observe freed blocks while a clearer runs, and the
+        // clearer must still see every value exactly once.
+        const WRITERS: usize = 4;
+        const PER_WRITER: u64 = (if cfg!(miri) { 500 } else { 50_000 }) as u64;
+
+        let bucket = AtomicBucket::new();
+        let done = AtomicUsize::new(0);
+
+        let cleared = thread::scope(|s| {
+            for _ in 0..WRITERS {
+                s.spawn(|| {
+                    for i in 0..PER_WRITER {
+                        bucket.push(i);
+                    }
+                    done.fetch_add(1, Ordering::Release);
+                });
+            }
+
+            for _ in 0..2 {
+                s.spawn(|| {
+                    while done.load(Ordering::Acquire) < WRITERS {
+                        bucket.data_with(|xs| {
+                            for x in xs {
+                                assert!(*x < PER_WRITER);
+                            }
+                        });
+                    }
+                });
+            }
+
+            let mut cleared = 0u64;
+            while done.load(Ordering::Acquire) < WRITERS {
+                bucket.clear_with(|xs| cleared += xs.len() as u64);
+            }
+            bucket.clear_with(|xs| cleared += xs.len() as u64);
+            cleared
+        });
+
+        assert_eq!(cleared, WRITERS as u64 * PER_WRITER);
+        assert!(bucket.is_empty());
     }
 
     #[test]
@@ -665,5 +906,70 @@ mod tests {
             assert!(!bucket.is_empty());
             i += 1;
         }
+    }
+
+    #[test]
+    fn test_panicking_callbacks_do_not_wedge_bucket() {
+        let bucket = AtomicBucket::new();
+        for i in 0..BLOCK_SIZE * 2 {
+            bucket.push(i);
+        }
+
+        // A panic while reading must still exit the stripe, so that clearing can proceed...
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bucket.data_with(|_| panic!("reader"));
+        }));
+        assert!(result.is_err());
+
+        // ... and a panic while clearing must still free (and thus drop) the detached values.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bucket.clear_with(|_| panic!("clearer"));
+        }));
+        assert!(result.is_err());
+        assert!(bucket.is_empty());
+
+        bucket.push(42);
+        assert_eq!(bucket.data(), vec![42]);
+        let mut cleared = 0;
+        bucket.clear_with(|xs| cleared += xs.len());
+        assert_eq!(cleared, 1);
+    }
+
+    #[test]
+    fn test_bucket_drops_values() {
+        struct Droppable<'a>(&'a AtomicUsize);
+
+        impl Drop for Droppable<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = AtomicUsize::new(0);
+        let bucket = AtomicBucket::new();
+
+        // Push from several threads.
+        thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..BLOCK_SIZE * 3 + 7 {
+                        bucket.push(Droppable(&drops));
+                    }
+                });
+            }
+        });
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        // Clearing drops the values that were cleared...
+        let mut cleared = 0;
+        bucket.clear_with(|xs| cleared += xs.len());
+        assert_eq!(cleared, 4 * (BLOCK_SIZE * 3 + 7));
+        assert_eq!(drops.load(Ordering::Relaxed), cleared);
+
+        // ... and dropping the bucket drops whatever is left.
+        bucket.push(Droppable(&drops));
+        bucket.push(Droppable(&drops));
+        drop(bucket);
+        assert_eq!(drops.load(Ordering::Relaxed), cleared + 2);
     }
 }
