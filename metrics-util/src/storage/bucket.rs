@@ -1,19 +1,22 @@
 use crossbeam_utils::{Backoff, CachePadded};
 use std::{
-    cell::{Cell, UnsafeCell},
+    alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout},
+    cell::Cell,
     cmp::min,
-    mem::MaybeUninit,
-    ptr, slice,
+    marker::PhantomData,
+    mem, ptr, slice,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
     sync::{Mutex, OnceLock, PoisonError},
 };
 
-#[cfg(target_pointer_width = "16")]
-const BLOCK_SIZE: usize = 16;
-#[cfg(target_pointer_width = "32")]
-const BLOCK_SIZE: usize = 32;
-#[cfg(target_pointer_width = "64")]
-const BLOCK_SIZE: usize = 64;
+/// Number of slots in the first block of a stripe.
+///
+/// Blocks double in size as a stripe grows, up to `MAX_BLOCK_SIZE`, so that a stripe holding only
+/// a few values costs only a small block, while a busy stripe quickly gets to full-size blocks.
+const MIN_BLOCK_SIZE: usize = 8;
+
+/// Number of slots in a block, at most.
+const MAX_BLOCK_SIZE: usize = 64;
 
 /// Upper bound on the number of stripes in a bucket.
 ///
@@ -22,145 +25,164 @@ const BLOCK_SIZE: usize = 64;
 const MAX_STRIPES: usize = 256;
 
 /// Discrete chunk of values with atomic read/write access.
+///
+/// A block is a single allocation: this header, followed by `capacity` "ready" flags, followed by
+/// `capacity` slots.  The flags and slots live outside of `Block<T>` itself, so a block is only
+/// ever handled through a raw pointer to the allocation, and every method takes one.  See
+/// [`allocate`](Block::allocate) and [`free`](Block::free).
 struct Block<T> {
     // Write index.
-    write: AtomicUsize,
-
-    // Per-slot "ready" flags.
     //
     // Internally, we track the write index which indicates what slot should be written by the next
     // writer.  This works fine as writers race via CAS to "acquire" a slot to write to.  The
     // trouble comes when attempting to read written values, as writers may still have writes
     // in-flight, thus leading to potential uninitialized reads, UB, and the world imploding.
     //
-    // We use a simple scheme where writers acknowledge their writes by setting the flag that
-    // corresponds to the index that they've written, with a release store, so that publishing a
-    // value costs a plain store rather than a read-modify-write.  The number of initialized slots
+    // We use a simple scheme where writers acknowledge their writes by setting the "ready" flag
+    // that corresponds to the index that they've written, with a release store, so that publishing
+    // a value costs a plain store rather than a read-modify-write.  The number of initialized slots
     // is then the length of the leading run of set flags, which readers compute by scanning the
-    // flags; that's a linear scan, but over a single cache line, and readers are rare compared to
+    // flags; that's a linear scan, but over at most a cache line, and readers are rare compared to
     // writers.
-    ready: [AtomicBool; BLOCK_SIZE],
-
-    // The individual slots.
-    slots: [MaybeUninit<UnsafeCell<T>>; BLOCK_SIZE],
+    write: AtomicUsize,
 
     // The "next" block to iterate, aka the block that came before this one.
     next: AtomicPtr<Block<T>>,
+
+    // Number of slots, and of ready flags, that follow the header.
+    capacity: usize,
+
+    _values: PhantomData<T>,
 }
 
 impl<T> Block<T> {
-    /// Creates a new [`Block`].
-    pub fn new() -> Self {
+    // The ready flags directly follow the header.
+    const FLAGS_OFFSET: usize = mem::size_of::<Self>();
+
+    // The slots follow the flags, at the first suitably aligned offset.
+    fn slots_offset(capacity: usize) -> usize {
+        let align = mem::align_of::<T>();
+        (Self::FLAGS_OFFSET + capacity + align - 1) & !(align - 1)
+    }
+
+    // The layout of the allocation for a block with the given capacity.
+    fn layout(capacity: usize) -> Layout {
+        let size = Self::slots_offset(capacity) + capacity * mem::size_of::<T>();
+        let align = mem::align_of::<Self>().max(mem::align_of::<T>());
+        Layout::from_size_align((size + align - 1) & !(align - 1), align)
+            .expect("block capacity overflow")
+    }
+
+    /// Allocates a new, empty block with room for `capacity` values.
+    fn allocate(capacity: usize) -> *mut Self {
+        let layout = Self::layout(capacity);
+
+        // SAFETY: The layout is never zero-sized, as it includes the header.
+        let block = unsafe { alloc_zeroed(layout) }.cast::<Self>();
+        if block.is_null() {
+            handle_alloc_error(layout);
+        }
+
         // SAFETY:
-        // At a high level, all types inherent to  `Block<T>` can be safely zero initialized.
-        //
-        // `write` is meant to start at zero (`AtomicUsize`)
-        // `ready` is meant to start all false (`AtomicBool`), which is zero
-        // `slots` is an array of `MaybeUninit`, which is zero init safe
-        // `next` is meant to start as "null", where the pointer (`AtomicPtr`) is zero
-        unsafe { MaybeUninit::zeroed().assume_init() }
+        // Zeroed memory is a valid block apart from `capacity`: `write` is meant to start at zero,
+        // `next` is meant to start as null, the ready flags are meant to start all `false`, and the
+        // slots are uninitialized until their ready flag is set.
+        unsafe { ptr::addr_of_mut!((*block).capacity).write(capacity) };
+
+        block
+    }
+
+    /// Frees a block, dropping the values in it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have exclusive ownership of the block, and every operation that may have
+    /// observed it must have completed.
+    unsafe fn free(block: *mut Self) {
+        while !Self::is_quiesced(block) {}
+
+        // SAFETY (for the drops): a slot's ready flag is only set once the slot has been fully
+        // written, guaranteeing that every slot below `len` is initialized.
+        let len = Self::len(block);
+        for index in 0..len {
+            ptr::drop_in_place(Self::slot(block, index));
+        }
+
+        dealloc(block.cast(), Self::layout((*block).capacity));
+    }
+
+    // Gets the ready flags of the block.
+    unsafe fn flags<'a>(block: *const Self) -> &'a [AtomicBool] {
+        let flags = block.cast::<u8>().add(Self::FLAGS_OFFSET).cast::<AtomicBool>();
+        slice::from_raw_parts(flags, (*block).capacity)
+    }
+
+    // Gets a pointer to the slot at `index`.
+    unsafe fn slot(block: *const Self, index: usize) -> *mut T {
+        let slots = block.cast::<u8>().add(Self::slots_offset((*block).capacity)).cast::<T>();
+        slots.add(index).cast_mut()
     }
 
     // Gets the length of the next block, if it exists.
     //
-    // SAFETY: The caller must ensure that the next block cannot be freed while this call is in
+    // SAFETY: The caller must ensure that neither block can be freed while this call is in
     // progress, which is to say that the caller must have entered the owning stripe.
-    unsafe fn next_len(&self) -> usize {
-        let tail = self.next.load(Ordering::Acquire);
-        if tail.is_null() {
+    unsafe fn next_len(block: *const Self) -> usize {
+        let next = (*block).next.load(Ordering::Acquire);
+        if next.is_null() {
             return 0;
         }
 
-        (*tail).len()
+        Self::len(next)
     }
 
     /// Gets the current length of this block.
-    pub fn len(&self) -> usize {
-        self.ready.iter().take_while(|ready| ready.load(Ordering::Acquire)).count()
+    unsafe fn len(block: *const Self) -> usize {
+        Self::flags(block).iter().take_while(|ready| ready.load(Ordering::Acquire)).count()
     }
 
     // Whether or not this block is currently quieseced i.e. no in-flight writes.
-    pub fn is_quiesced(&self) -> bool {
-        let len = self.len();
-        if len == BLOCK_SIZE {
+    unsafe fn is_quiesced(block: *const Self) -> bool {
+        let capacity = (*block).capacity;
+        let len = Self::len(block);
+        if len == capacity {
             return true;
         }
 
-        // We have to clamp self.write since multiple threads might race on filling the last block,
-        // so the value could actually exceed BLOCK_SIZE.
-        min(self.write.load(Ordering::Acquire), BLOCK_SIZE) == len
+        // We have to clamp `write` since multiple threads might race on filling the last slot, so
+        // the value could actually exceed the capacity.
+        min((*block).write.load(Ordering::Acquire), capacity) == len
     }
 
     /// Gets a slice of the data written to this block.
-    pub fn data(&self) -> &[T] {
+    unsafe fn data<'a>(block: *const Self) -> &'a [T] {
         // SAFETY:
-        // We take a pointer to the whole slot array, so that the slice we hand back is derived from
-        // the array rather than from the first slot alone, but the slice will only be as long as
-        // the number of slots written, indicated by `len`.  The value of `len` is only updated
-        // once a slot has been fully written, guaranteeing that every slot in the slice is
-        // initialized, and slots are never written again once they've been initialized.
-        let len = self.len();
-        unsafe {
-            let head = self.slots.as_ptr() as *const T;
-            slice::from_raw_parts(head, len)
-        }
+        // The slice is only as long as the number of slots written, indicated by `len`.  A slot's
+        // ready flag is only set once the slot has been fully written, guaranteeing that every
+        // slot in the slice is initialized, and slots are never written again once initialized.
+        slice::from_raw_parts(Self::slot(block, 0), Self::len(block))
     }
 
     /// Pushes a value into this block.
-    pub fn push(&self, value: T) -> Result<(), T> {
-        // Try to increment the index.  If we've reached the end of the block, let the bucket know
+    unsafe fn push(block: *const Self, value: T) -> Result<(), T> {
+        // Try to increment the index.  If we've reached the end of the block, let the stripe know
         // so it can attach another block.
-        let index = self.write.fetch_add(1, Ordering::Relaxed);
-        if index >= BLOCK_SIZE {
+        let index = (*block).write.fetch_add(1, Ordering::Relaxed);
+        if index >= (*block).capacity {
             return Err(value);
         }
 
         // SAFETY:
-        // - We never index outside of our block size.
-        // - Each slot is `MaybeUninit`, which itself can be safely zero initialized.
+        // - We never index outside of the block's capacity.
+        // - We own the slot, as the write index is only ever handed out once.
         // - We're writing an initialized value into the slot before anyone is able to ever read
         //   it, ensuring no uninitialized access.
-        unsafe {
-            // Update the slot.
-            self.slots.get_unchecked(index).assume_init_ref().get().write(value);
-        }
+        Self::slot(block, index).write(value);
 
         // Publish the slot.
-        self.ready[index].store(true, Ordering::Release);
+        Self::flags(block)[index].store(true, Ordering::Release);
 
         Ok(())
-    }
-}
-
-unsafe impl<T: Send> Send for Block<T> {}
-unsafe impl<T: Sync> Sync for Block<T> {}
-
-impl<T> Drop for Block<T> {
-    fn drop(&mut self) {
-        while !self.is_quiesced() {}
-
-        // SAFETY:
-        // The value of `len` is only updated once a slot has been fully written, guaranteeing the
-        // slot is initialized.  Thus, we're only touching initialized slots here.
-        unsafe {
-            let len = self.len();
-            for i in 0..len {
-                self.slots.get_unchecked(i).assume_init_ref().get().drop_in_place();
-            }
-        }
-    }
-}
-
-impl<T> std::fmt::Debug for Block<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let has_next = !self.next.load(Ordering::Acquire).is_null();
-        f.debug_struct("Block")
-            .field("type", &std::any::type_name::<T>())
-            .field("block_size", &BLOCK_SIZE)
-            .field("write", &self.write.load(Ordering::Acquire))
-            .field("len", &self.len())
-            .field("has_next", &has_next)
-            .finish()
     }
 }
 
@@ -174,7 +196,7 @@ impl<T> std::fmt::Debug for Block<T> {
 unsafe fn free_blocks<T>(mut block: *mut Block<T>) {
     while !block.is_null() {
         let next = (*block).next.load(Ordering::Acquire);
-        drop(Box::from_raw(block));
+        Block::free(block);
         block = next;
     }
 }
@@ -304,7 +326,7 @@ impl<T> Stripe<T> {
             let mut tail = self.tail.load(Ordering::Acquire);
             if tail.is_null() {
                 // No blocks at all yet.  We need to create one.
-                let new_block = Box::into_raw(Box::new(Block::new()));
+                let new_block = Block::allocate(MIN_BLOCK_SIZE);
                 match self.tail.compare_exchange(
                     ptr::null_mut(),
                     new_block,
@@ -316,25 +338,28 @@ impl<T> Stripe<T> {
                     // Somebody else beat us, so just update our pointer.
                     Err(current) => {
                         // SAFETY: We just allocated this block and nobody else has seen it.
-                        drop(unsafe { Box::from_raw(new_block) });
+                        unsafe { Block::free(new_block) };
                         tail = current;
                     }
                 }
             }
 
-            // SAFETY: We've entered the stripe, so the tail block cannot be freed until we exit.
-            let tail_block = unsafe { &*tail };
-
             // We have a block now, so we need to try writing to it.
-            match tail_block.push(original) {
+            //
+            // SAFETY: We've entered the stripe, so the tail block cannot be freed until we exit.
+            match unsafe { Block::push(tail, original) } {
                 // If the push was OK, then the block wasn't full.  It might _now_ be full, but we'll
                 // let future callers deal with installing a new block if necessary.
                 Ok(()) => break,
                 // The block was full, so we've been given the value back and we need to install a new block.
                 Err(value) => {
-                    let new_block = Box::into_raw(Box::new(Block::new()));
-
-                    // SAFETY: Nobody else can see the new block until we install it below.
+                    // Blocks double in size until they hit the cap, so that a stripe that only
+                    // ever holds a handful of values doesn't pay for a full-size block.
+                    //
+                    // SAFETY: We've entered the stripe, so the tail block cannot be freed, and
+                    // nobody else can see the new block until we install it below.
+                    let capacity = min(unsafe { (*tail).capacity } * 2, MAX_BLOCK_SIZE);
+                    let new_block = Block::allocate(capacity);
                     unsafe { (*new_block).next.store(tail, Ordering::Release) };
 
                     match self.tail.compare_exchange(
@@ -346,8 +371,7 @@ impl<T> Stripe<T> {
                         // We managed to install the block, so now push into it.
                         Ok(_) => {
                             // SAFETY: We've entered the stripe, so the block cannot be freed.
-                            let new_tail = unsafe { &*new_block };
-                            match new_tail.push(value) {
+                            match unsafe { Block::push(new_block, value) } {
                                 // We wrote the value successfully, so we're good here!
                                 Ok(()) => break,
                                 // The block was full, so just loop and start over.
@@ -358,7 +382,7 @@ impl<T> Stripe<T> {
                         // so let's just start over.
                         Err(_) => {
                             // SAFETY: We just allocated this block and nobody else has seen it.
-                            drop(unsafe { Box::from_raw(new_block) });
+                            unsafe { Block::free(new_block) };
                             original = value;
                         }
                     }
@@ -380,10 +404,7 @@ impl<T> Stripe<T> {
         // fresh block that has not been written to yet.
         //
         // SAFETY: We've entered the stripe, so no block reachable from the tail can be freed.
-        unsafe {
-            let tail_block = &*tail;
-            tail_block.len() == 0 && tail_block.next_len() == 0
-        }
+        unsafe { Block::len(tail) == 0 && Block::next_len(tail) == 0 }
     }
 
     /// Iterates all of the values in this stripe, invoking `f` for each block.
@@ -449,20 +470,18 @@ where
     // While we have a valid block -- either `tail` or the next block as we keep reading -- we
     // load the data from each block and process it by calling `f`.
     while !block.is_null() {
-        let block_ref = &*block;
-
         // We wait for the block to be quiesced to ensure we get any in-flight writes, and
         // snoozing specifically yields the reading thread to ensure things are given a
         // chance to complete.
-        while !block_ref.is_quiesced() {
+        while !Block::is_quiesced(block) {
             backoff.snooze();
         }
 
         // Read the data out of the block.
-        f(block_ref.data());
+        f(Block::data(block));
 
         // Load the next block.
-        block = block_ref.next.load(Ordering::Acquire);
+        block = (*block).next.load(Ordering::Acquire);
     }
 }
 
@@ -510,7 +529,8 @@ fn current_stripe_index(count: usize) -> usize {
 /// This bucket is implemented as a set of per-thread stripes, where each stripe is a singly-linked
 /// list of blocks, and each block is a small buffer that can hold a handful of elements.  There is
 /// no limit to how many elements can be in the bucket at a time.  Stripes and blocks are
-/// dynamically allocated as elements are pushed into the bucket.
+/// dynamically allocated as elements are pushed into the bucket, and blocks double in size as a
+/// stripe grows, from 8 elements up to 64.
 ///
 /// Each writing thread is mapped to a stripe, and only ever pushes into that stripe.  There are as
 /// many stripes as the machine has available parallelism (rounded up to a power of two), so when
@@ -523,18 +543,15 @@ fn current_stripe_index(count: usize) -> usize {
 /// quasi-reverse fashion, to allow writers to make forward progress without affecting the
 /// iteration of the previously written values.
 ///
-/// For example, in a scenario where an internal block can hold 4 elements, and a single thread has
-/// written 10 elements to the bucket, you would expect to see the values in this order when iterating:
+/// For example, if a single thread has written 30 elements to the bucket, you would expect to see
+/// the values in this order when iterating:
 ///
 /// ```text
-/// [6 7 8 9] [2 3 4 5] [0 1]
+/// [24 .. 29] [8 .. 23] [0 .. 7]
 /// ```
 ///
 /// When multiple threads have written to the bucket, the elements of each thread are grouped
 /// together in the same fashion, but the order in which the groups appear is arbitrary.
-///
-/// Block sizes are dependent on the target architecture, where each block can hold N items, and N
-/// is the number of bits in the target architecture's pointer width.
 pub struct AtomicBucket<T> {
     stripes: Box<[AtomicPtr<CachePadded<Stripe<T>>>]>,
 }
@@ -724,14 +741,47 @@ impl<T> std::fmt::Debug for AtomicBucket<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtomicBucket, Block, BLOCK_SIZE};
+    use super::{AtomicBucket, Block, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
     use std::thread;
 
+    /// A block that's freed when dropped, for testing blocks on their own.
+    struct OwnedBlock<T>(*mut Block<T>);
+
+    unsafe impl<T: Send + Sync> Sync for OwnedBlock<T> {}
+
+    impl<T> OwnedBlock<T> {
+        fn new(capacity: usize) -> Self {
+            OwnedBlock(Block::allocate(capacity))
+        }
+
+        fn push(&self, value: T) -> Result<(), T> {
+            // SAFETY: We own the block, so it can't be freed while it's in use.
+            unsafe { Block::push(self.0, value) }
+        }
+
+        fn len(&self) -> usize {
+            // SAFETY: We own the block, so it can't be freed while it's in use.
+            unsafe { Block::len(self.0) }
+        }
+
+        fn data(&self) -> &[T] {
+            // SAFETY: We own the block, so it can't be freed while it's in use.
+            unsafe { Block::data(self.0) }
+        }
+    }
+
+    impl<T> Drop for OwnedBlock<T> {
+        fn drop(&mut self) {
+            // SAFETY: We own the block, and nothing else can be using it once we're dropped.
+            unsafe { Block::free(self.0) }
+        }
+    }
+
     #[test]
     fn test_create_new_block() {
-        let block: Block<u64> = Block::new();
+        let block: OwnedBlock<u64> = OwnedBlock::new(MAX_BLOCK_SIZE);
         assert_eq!(block.len(), 0);
 
         let data = block.data();
@@ -740,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_block_write_then_read() {
-        let block = Block::new();
+        let block = OwnedBlock::new(MAX_BLOCK_SIZE);
         assert_eq!(block.len(), 0);
 
         let data = block.data();
@@ -757,7 +807,7 @@ mod tests {
 
     #[test]
     fn test_block_write_until_full_then_read() {
-        let block = Block::new();
+        let block = OwnedBlock::new(MAX_BLOCK_SIZE);
         assert_eq!(block.len(), 0);
 
         let data = block.data();
@@ -765,7 +815,7 @@ mod tests {
 
         let mut i = 0;
         let mut total = 0;
-        while i < BLOCK_SIZE as u64 {
+        while i < MAX_BLOCK_SIZE as u64 {
             assert!(block.push(i).is_ok());
 
             total += i;
@@ -773,7 +823,7 @@ mod tests {
         }
 
         let data = block.data();
-        assert_eq!(data.len(), BLOCK_SIZE);
+        assert_eq!(data.len(), MAX_BLOCK_SIZE);
 
         let sum: u64 = data.iter().sum();
         assert_eq!(sum, total);
@@ -784,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_block_write_until_full_then_read_mt() {
-        let block = Block::new();
+        let block = OwnedBlock::new(MAX_BLOCK_SIZE);
         assert_eq!(block.len(), 0);
 
         let data = block.data();
@@ -793,7 +843,7 @@ mod tests {
         let total = thread::scope(|s| {
             let writer = || {
                 let mut total = 0;
-                for i in 0..BLOCK_SIZE as u64 / 2 {
+                for i in 0..MAX_BLOCK_SIZE as u64 / 2 {
                     assert!(block.push(i).is_ok());
                     total += i;
                 }
@@ -805,7 +855,7 @@ mod tests {
         });
 
         let data = block.data();
-        assert_eq!(data.len(), BLOCK_SIZE);
+        assert_eq!(data.len(), MAX_BLOCK_SIZE);
 
         let sum: u64 = data.iter().sum();
         assert_eq!(sum, total);
@@ -831,7 +881,7 @@ mod tests {
         let snapshot = bucket.data();
         assert_eq!(snapshot.len(), 0);
 
-        let target = (BLOCK_SIZE * 3 + BLOCK_SIZE / 2) as u64;
+        let target = (MAX_BLOCK_SIZE * 3 + MAX_BLOCK_SIZE / 2) as u64;
         let mut i = 0;
         let mut total = 0;
         while i < target {
@@ -851,23 +901,71 @@ mod tests {
     #[test]
     fn test_bucket_single_thread_order() {
         // Blocks are visited newest first, and values within a block are in insertion order.
+        // Blocks double in size from `MIN_BLOCK_SIZE` up to `MAX_BLOCK_SIZE`, so the boundaries
+        // fall at 8, 24, 56, 120, and then every 64 values.
         let bucket = AtomicBucket::new();
-        let target = BLOCK_SIZE * 2 + BLOCK_SIZE / 2;
+        let target = 160;
         for i in 0..target {
             bucket.push(i);
         }
 
         let mut expected = Vec::new();
-        expected.extend(BLOCK_SIZE * 2..target);
-        expected.extend(BLOCK_SIZE..BLOCK_SIZE * 2);
-        expected.extend(0..BLOCK_SIZE);
+        expected.extend(120..target);
+        expected.extend(56..120);
+        expected.extend(24..56);
+        expected.extend(8..24);
+        expected.extend(0..8);
         assert_eq!(bucket.data(), expected);
+
+        // Clearing starts a stripe over from the smallest block.
+        bucket.clear();
+        for i in 0..20 {
+            bucket.push(i);
+        }
+        let mut expected = Vec::new();
+        expected.extend(8..20);
+        expected.extend(0..8);
+        assert_eq!(bucket.data(), expected);
+    }
+
+    #[test]
+    fn test_bucket_block_growth() {
+        let bucket = AtomicBucket::new();
+        let mut block_sizes = Vec::new();
+        for i in 0..(MIN_BLOCK_SIZE + 16 + 32 + MAX_BLOCK_SIZE * 2) {
+            bucket.push(i);
+        }
+        bucket.data_with(|block| block_sizes.push(block.len()));
+        assert_eq!(block_sizes, vec![MAX_BLOCK_SIZE, MAX_BLOCK_SIZE, 32, 16, MIN_BLOCK_SIZE]);
+    }
+
+    #[test]
+    fn test_bucket_overaligned_values() {
+        #[derive(Clone, Debug, PartialEq)]
+        #[repr(align(64))]
+        struct Big([u8; 3]);
+
+        let bucket = AtomicBucket::new();
+        for i in 0..MIN_BLOCK_SIZE * 4 {
+            bucket.push(Big([i as u8; 3]));
+        }
+
+        let values = bucket.data();
+        assert_eq!(values.len(), MIN_BLOCK_SIZE * 4);
+        for value in &values {
+            assert_eq!(value.0[0], value.0[1]);
+            assert_eq!(value.0[0], value.0[2]);
+        }
+        assert_eq!(
+            values.iter().map(|v| v.0[0] as usize).sum::<usize>(),
+            (0..MIN_BLOCK_SIZE * 4).sum()
+        );
     }
 
     #[test]
     fn test_bucket_write_then_read_mt() {
         const PER_WRITER: u64 =
-            (if cfg!(miri) { BLOCK_SIZE * 10 } else { BLOCK_SIZE * 100_000 }) as u64;
+            (if cfg!(miri) { MAX_BLOCK_SIZE * 10 } else { MAX_BLOCK_SIZE * 100_000 }) as u64;
 
         let bucket = AtomicBucket::new();
 
@@ -1001,7 +1099,7 @@ mod tests {
 
         let mut i = 0;
         let mut total_pushed = 0;
-        while i < BLOCK_SIZE * 4 {
+        while i < MAX_BLOCK_SIZE * 4 {
             bucket.push(i);
 
             total_pushed += i;
@@ -1031,7 +1129,7 @@ mod tests {
         // the first block, to the second block, to exercise the
         // `Block::next_len` codepath.
         let mut i = 0;
-        while i < BLOCK_SIZE * 2 {
+        while i < MAX_BLOCK_SIZE * 2 {
             bucket.push(i);
             assert!(!bucket.is_empty());
             i += 1;
@@ -1041,7 +1139,7 @@ mod tests {
     #[test]
     fn test_panicking_callbacks_do_not_wedge_bucket() {
         let bucket = AtomicBucket::new();
-        for i in 0..BLOCK_SIZE * 2 {
+        for i in 0..MAX_BLOCK_SIZE * 2 {
             bucket.push(i);
         }
 
@@ -1082,7 +1180,7 @@ mod tests {
         thread::scope(|s| {
             for _ in 0..4 {
                 s.spawn(|| {
-                    for _ in 0..BLOCK_SIZE * 3 + 7 {
+                    for _ in 0..MAX_BLOCK_SIZE * 3 + 7 {
                         bucket.push(Droppable(&drops));
                     }
                 });
@@ -1093,7 +1191,7 @@ mod tests {
         // Clearing drops the values that were cleared...
         let mut cleared = 0;
         bucket.clear_with(|xs| cleared += xs.len());
-        assert_eq!(cleared, 4 * (BLOCK_SIZE * 3 + 7));
+        assert_eq!(cleared, 4 * (MAX_BLOCK_SIZE * 3 + 7));
         assert_eq!(drops.load(Ordering::Relaxed), cleared);
 
         // ... and dropping the bucket drops whatever is left.
