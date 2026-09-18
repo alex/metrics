@@ -73,7 +73,6 @@ predicates = { workspace = true }
 predicates-core = { workspace = true }
 predicates-tree = { workspace = true }
 quickcheck = { workspace = true }
-quickcheck_macros = { workspace = true }
 rand = { workspace = true }
 sketches-ddsketch = { workspace = true }
 tracing = { workspace = true }
