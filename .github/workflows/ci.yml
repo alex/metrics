@@ -65,6 +65,17 @@ jobs:
       run: rustup +nightly component add miri
     - name: Run Tests
       run: cargo +nightly miri test -p metrics-util --all-features
+  loom:
+    name: Test AtomicBucket under loom
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install Rust Stable
+      run: rustup default stable
+    - name: Run Tests
+      run: cargo test -p metrics-util --release --lib -- storage::bucket::loom_tests
+      env:
+        RUSTFLAGS: --cfg loom
   libs-msrv:
     name: Check library MSRV
     runs-on: ubuntu-latest

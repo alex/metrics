@@ -59,6 +59,9 @@ rand_xoshiro = { workspace = true, default-features = false, optional = true }
 radix_trie = { workspace = true, optional = true }
 sketches-ddsketch = { workspace = true, optional = true }
 
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
 [dev-dependencies]
 approx = { workspace = true }
 criterion = { workspace = true }
@@ -87,3 +90,6 @@ layer-router = ["radix_trie"]
 recency = ["registry", "quanta"]
 registry = ["hashbrown", "storage"]
 storage = ["crossbeam-utils", "rand", "rand_xoshiro", "sketches-ddsketch"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

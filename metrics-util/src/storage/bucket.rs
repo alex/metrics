@@ -1,19 +1,32 @@
-use crossbeam_utils::{Backoff, CachePadded};
+use crossbeam_utils::CachePadded;
 use std::{
-    alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout},
+    alloc::{alloc, dealloc, handle_alloc_error, Layout},
     cell::Cell,
     cmp::min,
     marker::PhantomData,
     mem, ptr, slice,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
-    sync::{Mutex, OnceLock, PoisonError},
+    sync::PoisonError,
+};
+
+#[cfg(loom)]
+use loom::sync::{
+    atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    Mutex,
+};
+#[cfg(not(loom))]
+use {
+    crossbeam_utils::Backoff,
+    std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    std::sync::Mutex,
 };
 
 /// Number of slots in the first block of a stripe.
 ///
 /// Blocks double in size as a stripe grows, up to `MAX_BLOCK_SIZE`, so that a stripe holding only
 /// a few values costs only a small block, while a busy stripe quickly gets to full-size blocks.
-const MIN_BLOCK_SIZE: usize = 8;
+///
+/// Under loom, blocks start tiny so that the tests hit block boundaries within a few pushes.
+const MIN_BLOCK_SIZE: usize = if cfg!(loom) { 2 } else { 8 };
 
 /// Number of slots in a block, at most.
 const MAX_BLOCK_SIZE: usize = 64;
@@ -22,6 +35,7 @@ const MAX_BLOCK_SIZE: usize = 64;
 ///
 /// The actual number of stripes is derived from the available parallelism of the machine, rounded
 /// up to a power of two, so this only kicks in on very large machines.
+#[cfg(not(loom))]
 const MAX_STRIPES: usize = 256;
 
 /// Discrete chunk of values with atomic read/write access.
@@ -56,21 +70,20 @@ struct Block<T> {
 }
 
 impl<T> Block<T> {
-    // The ready flags directly follow the header.
-    const FLAGS_OFFSET: usize = mem::size_of::<Self>();
+    // The ready flags follow the header, at the first suitably aligned offset.
+    const FLAGS_OFFSET: usize = align_up(mem::size_of::<Self>(), mem::align_of::<AtomicBool>());
 
     // The slots follow the flags, at the first suitably aligned offset.
     fn slots_offset(capacity: usize) -> usize {
-        let align = mem::align_of::<T>();
-        (Self::FLAGS_OFFSET + capacity + align - 1) & !(align - 1)
+        align_up(Self::FLAGS_OFFSET + capacity * mem::size_of::<AtomicBool>(), mem::align_of::<T>())
     }
 
     // The layout of the allocation for a block with the given capacity.
     fn layout(capacity: usize) -> Layout {
         let size = Self::slots_offset(capacity) + capacity * mem::size_of::<T>();
-        let align = mem::align_of::<Self>().max(mem::align_of::<T>());
-        Layout::from_size_align((size + align - 1) & !(align - 1), align)
-            .expect("block capacity overflow")
+        let align =
+            mem::align_of::<Self>().max(mem::align_of::<AtomicBool>()).max(mem::align_of::<T>());
+        Layout::from_size_align(align_up(size, align), align).expect("block capacity overflow")
     }
 
     /// Allocates a new, empty block with room for `capacity` values.
@@ -78,16 +91,26 @@ impl<T> Block<T> {
         let layout = Self::layout(capacity);
 
         // SAFETY: The layout is never zero-sized, as it includes the header.
-        let block = unsafe { alloc_zeroed(layout) }.cast::<Self>();
+        let block = unsafe { alloc(layout) }.cast::<Self>();
         if block.is_null() {
             handle_alloc_error(layout);
         }
 
         // SAFETY:
-        // Zeroed memory is a valid block apart from `capacity`: `write` is meant to start at zero,
-        // `next` is meant to start as null, the ready flags are meant to start all `false`, and the
-        // slots are uninitialized until their ready flag is set.
-        unsafe { ptr::addr_of_mut!((*block).capacity).write(capacity) };
+        // We initialize every part of the block other than the slots, which stay uninitialized
+        // until their ready flag is set.  The atomics are constructed rather than zeroed, as that
+        // is what loom's atomics require.
+        unsafe {
+            ptr::addr_of_mut!((*block).write).write(AtomicUsize::new(0));
+            ptr::addr_of_mut!((*block).next).write(AtomicPtr::new(ptr::null_mut()));
+            ptr::addr_of_mut!((*block).capacity).write(capacity);
+            ptr::addr_of_mut!((*block)._values).write(PhantomData);
+
+            let flags = block.cast::<u8>().add(Self::FLAGS_OFFSET).cast::<AtomicBool>();
+            for index in 0..capacity {
+                flags.add(index).write(AtomicBool::new(false));
+            }
+        }
 
         block
     }
@@ -99,13 +122,26 @@ impl<T> Block<T> {
     /// The caller must have exclusive ownership of the block, and every operation that may have
     /// observed it must have completed.
     unsafe fn free(block: *mut Self) {
-        while !Self::is_quiesced(block) {}
+        spin_until(|| Self::is_quiesced(block));
 
         // SAFETY (for the drops): a slot's ready flag is only set once the slot has been fully
         // written, guaranteeing that every slot below `len` is initialized.
         let len = Self::len(block);
         for index in 0..len {
             ptr::drop_in_place(Self::slot(block, index));
+        }
+
+        // Under loom, the block is poisoned and leaked instead of freed, so that a protocol bug
+        // that lets a thread touch a freed block shows up as garbage values in the loom tests,
+        // rather than as undefined behaviour that the model checker cannot observe.
+        if cfg!(loom) {
+            let capacity = (*block).capacity;
+            ptr::write_bytes(
+                Self::slot(block, 0).cast::<u8>(),
+                0xff,
+                capacity * mem::size_of::<T>(),
+            );
+            return;
         }
 
         dealloc(block.cast(), Self::layout((*block).capacity));
@@ -184,6 +220,11 @@ impl<T> Block<T> {
 
         Ok(())
     }
+}
+
+/// Rounds `value` up to the next multiple of `align`, which must be a power of two.
+const fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
 }
 
 /// Frees a singly-linked list of blocks, starting at `block`.
@@ -308,10 +349,7 @@ impl<T> Stripe<T> {
         // in the previous phase, and every operation that enters from here on lands in the new
         // phase, so the previous phase's count can only go down.
         let previous = phase_of(self.state.fetch_xor(PHASE_BIT, Ordering::AcqRel));
-        let backoff = Backoff::new();
-        while count_of(self.state.load(Ordering::Acquire), previous) != 0 {
-            backoff.snooze();
-        }
+        spin_until(|| count_of(self.state.load(Ordering::Acquire), previous) == 0);
 
         detached
     }
@@ -465,17 +503,11 @@ unsafe fn visit_blocks<T, F>(mut block: *mut Block<T>, f: &mut F)
 where
     F: FnMut(&[T]),
 {
-    let backoff = Backoff::new();
-
     // While we have a valid block -- either `tail` or the next block as we keep reading -- we
     // load the data from each block and process it by calling `f`.
     while !block.is_null() {
-        // We wait for the block to be quiesced to ensure we get any in-flight writes, and
-        // snoozing specifically yields the reading thread to ensure things are given a
-        // chance to complete.
-        while !Block::is_quiesced(block) {
-            backoff.snooze();
-        }
+        // We wait for the block to be quiesced to ensure we get any in-flight writes.
+        spin_until(|| Block::is_quiesced(block));
 
         // Read the data out of the block.
         f(Block::data(block));
@@ -485,12 +517,32 @@ where
     }
 }
 
+/// Spins until `ready` returns true.
+///
+/// Snoozing yields the waiting thread, to ensure that whatever it's waiting on is given a chance to
+/// complete.  Under loom, yielding is also what lets the model checker schedule the other threads.
+fn spin_until(mut ready: impl FnMut() -> bool) {
+    #[cfg(not(loom))]
+    {
+        let backoff = Backoff::new();
+        while !ready() {
+            backoff.snooze();
+        }
+    }
+
+    #[cfg(loom)]
+    while !ready() {
+        loom::thread::yield_now();
+    }
+}
+
 /// Gets the number of stripes used by every bucket.
 ///
 /// This is the available parallelism of the machine, rounded up to a power of two, so that the
 /// stripe index can be computed with a mask.
+#[cfg(not(loom))]
 fn stripe_count() -> usize {
-    static COUNT: OnceLock<usize> = OnceLock::new();
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *COUNT.get_or_init(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -504,12 +556,42 @@ fn stripe_count() -> usize {
 ///
 /// Every thread is assigned a unique, sequential ID the first time it pushes into any bucket, so
 /// the first N threads to push always land on distinct stripes of an N-stripe bucket.
+#[cfg(not(loom))]
 #[inline]
 fn current_stripe_index(count: usize) -> usize {
     static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
 
     thread_local! {
         static THREAD_ID: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    let id = THREAD_ID.with(|cell| {
+        let mut id = cell.get();
+        if id == usize::MAX {
+            id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+            cell.set(id);
+        }
+        id
+    });
+
+    id & (count - 1)
+}
+
+/// Under loom, buckets have two stripes, so that the tests cover both writers that share a stripe
+/// and writers on separate stripes.
+#[cfg(loom)]
+fn stripe_count() -> usize {
+    2
+}
+
+#[cfg(loom)]
+fn current_stripe_index(count: usize) -> usize {
+    loom::lazy_static! {
+        static ref NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+    }
+
+    loom::thread_local! {
+        static THREAD_ID: Cell<usize> = Cell::new(usize::MAX);
     }
 
     let id = THREAD_ID.with(|cell| {
@@ -712,8 +794,8 @@ impl<T> Drop for AtomicBucket<T> {
     fn drop(&mut self) {
         // We have exclusive access to the bucket, so there can be no in-flight operations, and
         // every stripe and block still attached to the bucket is exclusively ours to free.
-        for slot in self.stripes.iter_mut() {
-            let stripe = *slot.get_mut();
+        for slot in self.stripes.iter() {
+            let stripe = slot.load(Ordering::Acquire);
             if stripe.is_null() {
                 continue;
             }
@@ -739,7 +821,138 @@ impl<T> std::fmt::Debug for AtomicBucket<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::AtomicBucket;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    fn model<F>(f: F)
+    where
+        F: Fn() + Sync + Send + 'static,
+    {
+        // Exhaustive exploration of these scenarios takes far too long, so the number of
+        // preemptions is bounded unless the environment says otherwise.  Every protocol bug
+        // tried against these scenarios is caught with a bound of 2; the cost roughly triples
+        // with each extra preemption, and 5 keeps the run to seconds.
+        let mut builder = loom::model::Builder::new();
+        if builder.preemption_bound.is_none() {
+            builder.preemption_bound = Some(5);
+        }
+        builder.check(f);
+    }
+
+    /// Two writers push across block boundaries while the bucket is cleared underneath them, and
+    /// every value must be seen exactly once between the concurrent clear and a final one.
+    #[test]
+    fn concurrent_pushes_and_clear() {
+        model(|| {
+            let bucket = Arc::new(AtomicBucket::new());
+
+            let writers = (0..2)
+                .map(|writer| {
+                    let bucket = Arc::clone(&bucket);
+                    thread::spawn(move || {
+                        for i in 0..3usize {
+                            bucket.push(writer * 10 + i);
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut seen = Vec::new();
+            bucket.clear_with(|xs| seen.extend_from_slice(xs));
+
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            bucket.clear_with(|xs| seen.extend_from_slice(xs));
+
+            seen.sort_unstable();
+            assert_eq!(seen, vec![0, 1, 2, 10, 11, 12]);
+            assert!(bucket.is_empty());
+        });
+    }
+
+    /// A reader walks the bucket while a writer pushes and a clearer frees blocks: the reader must
+    /// only ever see values that were actually written (freed blocks are poisoned under loom, so
+    /// reading one shows up as a bogus value), and the clears must see each value once.
+    #[test]
+    fn concurrent_push_read_and_clear() {
+        model(|| {
+            let bucket = Arc::new(AtomicBucket::new());
+
+            let writer = {
+                let bucket = Arc::clone(&bucket);
+                thread::spawn(move || {
+                    for i in 0..3usize {
+                        bucket.push(i);
+                    }
+                })
+            };
+
+            let reader = {
+                let bucket = Arc::clone(&bucket);
+                thread::spawn(move || {
+                    bucket.data_with(|xs| {
+                        for x in xs {
+                            assert!(*x < 3, "read a value that was never written: {}", x);
+                        }
+                    });
+                })
+            };
+
+            let mut seen = Vec::new();
+            bucket.clear_with(|xs| seen.extend_from_slice(xs));
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+            bucket.clear_with(|xs| seen.extend_from_slice(xs));
+
+            seen.sort_unstable();
+            assert_eq!(seen, vec![0, 1, 2]);
+        });
+    }
+
+    /// Two clearers race each other while a writer pushes: between them they must see every value
+    /// exactly once.
+    #[test]
+    fn concurrent_clears() {
+        model(|| {
+            let bucket = Arc::new(AtomicBucket::new());
+
+            let writer = {
+                let bucket = Arc::clone(&bucket);
+                thread::spawn(move || {
+                    for i in 0..3usize {
+                        bucket.push(i);
+                    }
+                })
+            };
+
+            let clearer = {
+                let bucket = Arc::clone(&bucket);
+                thread::spawn(move || {
+                    let mut seen = Vec::new();
+                    bucket.clear_with(|xs| seen.extend_from_slice(xs));
+                    seen
+                })
+            };
+
+            let mut seen = Vec::new();
+            bucket.clear_with(|xs| seen.extend_from_slice(xs));
+
+            writer.join().unwrap();
+            seen.extend(clearer.join().unwrap());
+            bucket.clear_with(|xs| seen.extend_from_slice(xs));
+
+            seen.sort_unstable();
+            assert_eq!(seen, vec![0, 1, 2]);
+        });
+    }
+}
+
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::{AtomicBucket, Block, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE};
     use std::sync::atomic::{AtomicUsize, Ordering};

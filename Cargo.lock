@@ -1249,6 +1249,7 @@ dependencies = [
  "getopts",
  "hashbrown 0.16.1",
  "indexmap",
+ "loom",
  "metrics",
  "mockall",
  "ndarray",
